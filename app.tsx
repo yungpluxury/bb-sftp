@@ -11,7 +11,7 @@ import {
   type ExperimentalThreadActionTabProps,
   type PluginNavPanelProps,
 } from "@get-bb/plugin-sdk/app";
-import type { RemoteEntry, rpcContract } from "./server";
+import type { RemoteEntry, rpcContract, SftpSummary } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -1442,33 +1442,103 @@ function SshPage({ subPath }: PluginNavPanelProps) {
   );
 }
 
+type SftpPending = { folder: string; sha256: string; entries: SftpSummary[] };
+
+function SftpTrustCard({
+  pending,
+  error,
+  onTrust,
+  onDismiss,
+}: {
+  pending: SftpPending[];
+  error: string | null;
+  onTrust: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5 border-b border-border px-3 py-2 text-xs">
+      <span className="font-medium">Использовать подключения из .vscode/sftp.json?</span>
+      {pending.map((item) => (
+        <div key={item.folder} className="flex flex-col gap-0.5">
+          <span className="truncate font-mono text-muted-foreground" title={item.folder}>
+            {shortHome(item.folder)}/.vscode/sftp.json
+          </span>
+          {item.entries.map((entry) => (
+            <span key={entry.id} className="truncate font-mono" title={`${entry.local} ⇄ ${entry.remotePath}`}>
+              {entry.id}: {entry.user === null ? "" : `${entry.user}@`}
+              {entry.host}:{entry.port} {entry.remotePath}
+              {entry.hasSecret ? " · пароль из файла" : ""}
+            </span>
+          ))}
+        </div>
+      ))}
+      <span className="text-muted-foreground">
+        Файл лежит в проекте – доверяйте, только если сами его писали или знаете, откуда он. Если файл изменится, вопрос появится снова.
+      </span>
+      <div className="flex items-center gap-1">
+        <Button size="sm" className="h-7" onClick={onTrust}>
+          Доверять
+        </Button>
+        <Button size="sm" variant="ghost" className="h-7" onClick={onDismiss}>
+          Не использовать
+        </Button>
+      </div>
+      {error !== null ? <ErrorLine>{error}</ErrorLine> : null}
+    </div>
+  );
+}
+
 function ThreadSshTab({ threadId }: ExperimentalThreadActionTabProps) {
   const rpc = useRpc<typeof rpcContract>();
   const [ready, setReady] = useState(false);
   const [host, setHost] = useState<string | null>(null);
   const [fixedRoot, setFixedRoot] = useState<string | undefined>(undefined);
   const [file, setFile] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
+  const [pending, setPending] = useState<SftpPending[]>([]);
+  const [trustError, setTrustError] = useState<string | null>(null);
 
   useEffect(() => {
+    rpc.call("ssh_sftp_pending", { threadId }).then(
+      (result) => setPending(result.pending),
+      () => setPending([]),
+    );
     rpc
       .call("ssh_thread_target", { threadId })
       .then(
         (target) => {
-          if (target === null) return setHost(localStorage.getItem(HOST_KEY));
+          if (target === null) return setHost((current) => current ?? localStorage.getItem(HOST_KEY));
           setHost(target.host);
           setFixedRoot(target.dir);
         },
-        () => setHost(localStorage.getItem(HOST_KEY)),
+        () => setHost((current) => current ?? localStorage.getItem(HOST_KEY)),
       )
       .finally(() => setReady(true));
-  }, [rpc, threadId]);
+  }, [rpc, threadId, version]);
+
+  const trust = async () => {
+    setTrustError(null);
+    try {
+      for (const item of pending) {
+        await rpc.call("ssh_sftp_trust", { threadId, folder: item.folder, sha256: item.sha256 });
+      }
+      setPending([]);
+      setFile(null);
+      setVersion((v) => v + 1);
+    } catch (cause) {
+      setTrustError(errorText(cause));
+    }
+  };
 
   if (!ready) return <Placeholder>Загрузка…</Placeholder>;
 
   return (
     <ThreadIdContext.Provider value={threadId}>
       <div className="flex h-full min-h-0 flex-col">
-        <div className={cn("min-h-0 flex-1", file !== null && "hidden")}>
+        {pending.length > 0 ? (
+          <SftpTrustCard pending={pending} error={trustError} onTrust={() => void trust()} onDismiss={() => setPending([])} />
+        ) : null}
+        <div key={version} className={cn("min-h-0 flex-1", file !== null && "hidden")}>
           <TreePanel
             host={host}
             activeFile={file}

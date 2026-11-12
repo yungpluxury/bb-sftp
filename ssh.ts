@@ -121,6 +121,10 @@ export function registerSftpTargets(targets: SftpTarget[]) {
   for (const target of targets) sftpTargets.set(target.id, target);
 }
 
+export function unregisterSftpTargets(ids: string[]) {
+  for (const id of ids) sftpTargets.delete(id);
+}
+
 export function registeredSftpTargets(): SftpTarget[] {
   return [...sftpTargets.values()];
 }

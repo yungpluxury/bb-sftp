@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join, resolve, sep } from "node:path";
 
 export type SftpTarget = {
@@ -97,20 +97,30 @@ function toTarget(config: RawConfig, workspace: string, id: string): SftpTarget 
 }
 
 export const ASKPASS_SCRIPT = `#!/bin/sh
-case "$1" in
-  *[Pp]assphrase*) [ -n "$BB_SSH_PASSPHRASE" ] && printf '%s\\n' "$BB_SSH_PASSPHRASE" && exit 0 ;;
-  *[Pp]assword*) [ -n "$BB_SSH_PASSWORD" ] && printf '%s\\n' "$BB_SSH_PASSWORD" && exit 0 ;;
-esac
+if [ -n "$BB_SSH_KEY" ] && [ -n "$BB_SSH_PASSPHRASE" ]; then
+  case "$1" in
+    "Enter passphrase for key '$BB_SSH_KEY'"*) printf '%s\\n' "$BB_SSH_PASSPHRASE"; exit 0 ;;
+  esac
+fi
+if [ -n "$BB_SSH_PASSWORD_PROMPT" ] && [ -n "$BB_SSH_PASSWORD" ]; then
+  case "$1" in
+    "$BB_SSH_PASSWORD_PROMPT"*) printf '%s\\n' "$BB_SSH_PASSWORD"; exit 0 ;;
+  esac
+fi
 exit 1
 `;
 
 export function askpassEnv(target: SftpTarget, scriptPath: string): Record<string, string> | null {
-  if (target.passphrase === null && target.password === null) return null;
+  const passphrase = target.keyPath === null ? null : target.passphrase;
+  if (passphrase === null && target.password === null) return null;
+  const user = target.user ?? userInfo().username;
   return {
     SSH_ASKPASS: scriptPath,
     SSH_ASKPASS_REQUIRE: "force",
     DISPLAY: process.env.DISPLAY ?? "bb-ssh",
-    BB_SSH_PASSPHRASE: target.passphrase ?? "",
+    BB_SSH_KEY: passphrase === null ? "" : (target.keyPath ?? ""),
+    BB_SSH_PASSPHRASE: passphrase ?? "",
+    BB_SSH_PASSWORD_PROMPT: target.password === null ? "" : `${user}@${target.hostName}'s password:`,
     BB_SSH_PASSWORD: target.password ?? "",
   };
 }
@@ -128,7 +138,10 @@ export function parseSftpConfig(text: string, workspace: string): SftpTarget[] {
     if (typeof config.profiles === "object" && config.profiles !== null) {
       for (const [profile, overrides] of Object.entries(config.profiles)) {
         if (typeof overrides !== "object" || overrides === null) continue;
-        const target = toTarget({ ...config, ...(overrides as RawConfig) }, workspace, `sftp:${name}/${profile}`);
+        const profileConfig = overrides as RawConfig;
+        const otherHost = profileConfig.host !== undefined && profileConfig.host !== config.host;
+        const inherited = otherHost ? { ...config, passphrase: undefined, password: undefined } : config;
+        const target = toTarget({ ...inherited, ...profileConfig }, workspace, `sftp:${name}/${profile}`);
         if (target !== null) targets.push(target);
       }
     }
@@ -138,6 +151,10 @@ export function parseSftpConfig(text: string, workspace: string): SftpTarget[] {
 
 export function sshDestinationArgs(target: SftpTarget): string[] {
   return [
+    "-F", "none",
+    ...(target.passphrase === null && target.password === null
+      ? []
+      : ["-o", "PreferredAuthentications=publickey,password"]),
     "-p", String(target.port),
     ...(target.user === null ? [] : ["-l", target.user]),
     ...(target.keyPath === null ? [] : ["-i", target.keyPath]),

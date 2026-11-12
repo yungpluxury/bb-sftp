@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { parseSftpConfig, type SftpTarget } from "./sftp.ts";
@@ -24,6 +24,7 @@ import {
   listConfiguredHosts,
   registerSftpTargets,
   registeredSftpTargets,
+  unregisterSftpTargets,
   listDir,
   makeRemoteDir,
   MAX_FILE_BYTES,
@@ -46,6 +47,17 @@ const SYNC_CHANGED = "sync-changed";
 const SCAN_TTL_MS = 15_000;
 
 const linkSchema = z.object({ local: z.string(), remote: z.string() });
+
+const sftpSummarySchema = z.object({
+  id: z.string(),
+  host: z.string(),
+  port: z.number(),
+  user: z.string().nullable(),
+  remotePath: z.string(),
+  local: z.string(),
+  hasSecret: z.boolean(),
+});
+export type SftpSummary = z.infer<typeof sftpSummarySchema>;
 
 const hostSchema = z.string().min(1).max(255);
 const absolutePath = z
@@ -157,6 +169,18 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().min(1) }),
     output: z.object({ host: z.string(), dir: z.string() }).nullable(),
   },
+  ssh_sftp_pending: {
+    input: z.object({ threadId: z.string().min(1) }),
+    output: z.object({
+      pending: z.array(
+        z.object({ folder: z.string(), sha256: z.string(), entries: z.array(sftpSummarySchema) }),
+      ),
+    }),
+  },
+  ssh_sftp_trust: {
+    input: z.object({ threadId: z.string().min(1), folder: z.string().min(1), sha256: z.string().regex(/^[0-9a-f]{64}$/) }),
+    output: z.object({ ok: z.boolean() }),
+  },
   ssh_mkdir: {
     input: z.object({ host: hostSchema, path: absolutePath }),
     output: z.object({ outcome: z.enum(["created", "exists"]) }),
@@ -261,20 +285,66 @@ export default async function plugin(bb: BbPluginApi) {
     return [...new Set(folders)];
   }
 
-  async function loadThreadSftp(threadId: string): Promise<SftpTarget[]> {
-    const found = new Map<string, SftpTarget>();
+  const idOwners = new Map<string, string>();
+
+  function uniqueId(baseId: string, folder: string): string {
+    const id = `${baseId}@${basename(folder)}`;
+    const owner = idOwners.get(id);
+    if (owner === undefined || owner === folder) {
+      idOwners.set(id, folder);
+      return id;
+    }
+    const hashed = `${id}#${sha256Hex(folder).slice(0, 4)}`;
+    idOwners.set(hashed, folder);
+    return hashed;
+  }
+
+  type ThreadSftp = {
+    trusted: SftpTarget[];
+    pending: { folder: string; sha256: string; entries: SftpSummary[] }[];
+  };
+
+  async function loadThreadSftp(threadId: string): Promise<ThreadSftp> {
+    const trust = (await bb.storage.kv.get<Record<string, string>>("sftpTrust")) ?? {};
+    const seen = new Set<string>();
+    const result: ThreadSftp = { trusted: [], pending: [] };
     for (const folder of await threadFolders(threadId)) {
       const text = await readFile(join(folder, ".vscode", "sftp.json"), "utf8").catch(() => null);
       if (text === null) continue;
+      let parsed: SftpTarget[];
       try {
-        for (const target of parseSftpConfig(text, folder)) if (!found.has(target.id)) found.set(target.id, target);
+        parsed = parseSftpConfig(text, folder);
       } catch {
         bb.log.warn(`sftp.json in ${folder} is not valid JSON`);
+        continue;
+      }
+      const fresh = parsed
+        .filter((target) => !seen.has(target.id))
+        .map((target) => ({ ...target, id: uniqueId(target.id, folder) }));
+      for (const target of parsed) seen.add(target.id);
+      if (fresh.length === 0) continue;
+      const sha256 = sha256Hex(text);
+      if (trust[folder] === sha256) {
+        result.trusted.push(...fresh);
+      } else {
+        result.pending.push({
+          folder,
+          sha256,
+          entries: fresh.map((target) => ({
+            id: target.id,
+            host: target.hostName,
+            port: target.port,
+            user: target.user,
+            remotePath: target.remotePath,
+            local: target.local,
+            hasSecret: target.passphrase !== null || target.password !== null,
+          })),
+        });
       }
     }
-    const targets = [...found.values()];
-    registerSftpTargets(targets);
-    return targets;
+    unregisterSftpTargets(result.pending.flatMap((item) => item.entries.map((entry) => entry.id)));
+    registerSftpTargets(result.trusted);
+    return result;
   }
 
   async function allLinks(): Promise<Record<string, Link>> {
@@ -286,7 +356,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     ssh_hosts: async (input) => {
-      const sftp = input?.threadId === undefined ? [] : await loadThreadSftp(input.threadId);
+      const sftp = input?.threadId === undefined ? [] : (await loadThreadSftp(input.threadId)).trusted;
       return {
         hosts: [...sftp.map((target) => target.id), ...(await listConfiguredHosts())],
         roots: await readRoots(),
@@ -376,9 +446,19 @@ export default async function plugin(bb: BbPluginApi) {
       if (result.outcome === "deleted") publishDirChanged(host, path);
       return result;
     },
+    ssh_sftp_pending: async ({ threadId }) => ({ pending: (await loadThreadSftp(threadId)).pending }),
+    ssh_sftp_trust: async ({ threadId, folder, sha256 }) => {
+      if (!(await threadFolders(threadId)).includes(folder)) throw new Error("Эта папка не относится к треду");
+      const text = await readFile(join(folder, ".vscode", "sftp.json"), "utf8").catch(() => null);
+      if (text === null || sha256Hex(text) !== sha256) throw new Error("sftp.json изменился, откройте вкладку заново");
+      const trust = (await bb.storage.kv.get<Record<string, string>>("sftpTrust")) ?? {};
+      await bb.storage.kv.set("sftpTrust", { ...trust, [folder]: sha256 });
+      bb.log.info(`sftp.json trusted for ${folder}`);
+      return { ok: true };
+    },
     ssh_thread_target: async ({ threadId }) => {
-      const sftp = await loadThreadSftp(threadId);
-      if (sftp.length > 0) return { host: sftp[0].id, dir: sftp[0].remotePath };
+      const { trusted } = await loadThreadSftp(threadId);
+      if (trusted.length > 0) return { host: trusted[0].id, dir: trusted[0].remotePath };
       return findLinkTarget(await readLinks(), await threadFolders(threadId));
     },
     ssh_open_terminal: async ({ host, dir, threadId }) => {
