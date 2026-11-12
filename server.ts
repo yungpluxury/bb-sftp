@@ -318,19 +318,18 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`sftp.json in ${folder} is not valid JSON`);
         continue;
       }
-      const fresh = parsed
-        .filter((target) => !seen.has(target.id))
-        .map((target) => ({ ...target, id: uniqueId(target.id, folder) }));
+      const all = parsed.map((target) => ({ ...target, id: uniqueId(target.id, folder), name: target.id }));
+      const fresh = all.filter((target) => !seen.has(target.name));
       for (const target of parsed) seen.add(target.id);
-      if (fresh.length === 0) continue;
+      if (all.length === 0) continue;
       const sha256 = sha256Hex(text);
       if (trust[folder] === sha256) {
-        result.trusted.push(...fresh);
+        result.trusted.push(...fresh.map(({ name: _name, ...target }) => target));
       } else {
         result.pending.push({
           folder,
           sha256,
-          entries: fresh.map((target) => ({
+          entries: all.map((target) => ({
             id: target.id,
             host: target.hostName,
             port: target.port,
