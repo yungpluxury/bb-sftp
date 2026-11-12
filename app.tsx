@@ -725,12 +725,14 @@ function TreePanel({
   fixedRoot?: string;
 }) {
   const rpc = useRpc<typeof rpcContract>();
+  const threadId = useContext(ThreadIdContext);
   const [hosts, setHosts] = useState<string[] | null>(null);
   const [roots, setRoots] = useState<Record<string, string> | null>(null);
   const [links, setLinks] = useState<Record<string, Link>>({});
   const [error, setError] = useState<string | null>(null);
   const [ownRoot, setOwnRoot] = useState<string | null>(fixedRoot ?? null);
-  const root = host === null || roots === null ? null : (ownRoot ?? roots[host] ?? "");
+  const sftpRoot = host?.startsWith("sftp:") ? links[host]?.remote : undefined;
+  const root = host === null || roots === null ? null : (ownRoot ?? roots[host] ?? sftpRoot ?? "");
   const [resolvedRoot, setResolvedRoot] = useState<string | null>(null);
   const [rootInput, setRootInput] = useState("");
   const [generation, setGeneration] = useState(0);
@@ -738,7 +740,7 @@ function TreePanel({
   const currentDir = selectedDir ?? resolvedRoot;
 
   useEffect(() => {
-    rpc.call("ssh_hosts").then(
+    rpc.call("ssh_hosts", threadId === null ? null : { threadId }).then(
       (result) => {
         setHosts(result.hosts);
         setRoots(result.roots);
@@ -746,7 +748,7 @@ function TreePanel({
       },
       (cause) => setError(errorText(cause)),
     );
-  }, [rpc]);
+  }, [rpc, threadId]);
 
   useEffect(() => {
     setResolvedRoot(null);

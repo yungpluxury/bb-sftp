@@ -66,7 +66,7 @@
     "vaul": "^1.1.2"
   },
   "scripts": {
-    "test": "node --test ssh.test.ts merge.test.ts local.test.ts",
+    "test": "node --test ssh.test.ts merge.test.ts local.test.ts sftp.test.ts",
     "typecheck": "tsc --noEmit"
   }
 }

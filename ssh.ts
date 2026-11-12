@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { chmod, readFile, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { ASKPASS_SCRIPT, askpassEnv, type SftpTarget, sshDestinationArgs } from "./sftp.ts";
 
 export const MAX_FILE_BYTES = 5 * 1024 * 1024;
 export const MAX_TRANSFER_BYTES = 20 * 1024 * 1024;
@@ -102,27 +103,63 @@ function looksBinary(data: Buffer): boolean {
   return data.subarray(0, 8192).includes(0);
 }
 
+const sftpTargets = new Map<string, SftpTarget>();
+
+let askpassPath: Promise<string> | null = null;
+
+function askpassScript(): Promise<string> {
+  askpassPath ??= (async () => {
+    const path = join(tmpdir(), `bb-ssh-askpass-${process.getuid?.() ?? "user"}.sh`);
+    await writeFile(path, ASKPASS_SCRIPT, { mode: 0o700 });
+    await chmod(path, 0o700);
+    return path;
+  })();
+  return askpassPath;
+}
+
+export function registerSftpTargets(targets: SftpTarget[]) {
+  for (const target of targets) sftpTargets.set(target.id, target);
+}
+
+export function registeredSftpTargets(): SftpTarget[] {
+  return [...sftpTargets.values()];
+}
+
+export async function destinationArgs(host: string): Promise<string[]> {
+  const sftp = sftpTargets.get(host);
+  if (sftp !== undefined) return sshDestinationArgs(sftp);
+  if (host.startsWith("sftp:")) {
+    throw new SshError(`Подключение «${host}» из sftp.json не загружено – откройте вкладку SSH в треде проекта`);
+  }
+  if (!(await listConfiguredHosts()).includes(host)) {
+    throw new SshError(`Хоста «${host}» нет в ~/.ssh/config`);
+  }
+  return [host];
+}
+
 async function runSsh(
   host: string,
   script: string,
   options: { stdin?: string | Buffer; maxBytes: number; timeoutMs: number },
 ): Promise<Buffer> {
-  const hosts = await listConfiguredHosts();
-  if (!hosts.includes(host)) {
-    throw new SshError(`Хоста «${host}» нет в ~/.ssh/config`);
-  }
+  const sftp = sftpTargets.get(host);
+  const secretEnv = sftp === undefined ? null : askpassEnv(sftp, await askpassScript());
   const args = [
-    "-o", "BatchMode=yes",
+    "-o", secretEnv === null ? "BatchMode=yes" : "BatchMode=no",
+    ...(secretEnv === null ? [] : ["-o", "NumberOfPasswordPrompts=1"]),
     "-o", "ConnectTimeout=10",
     "-o", "ServerAliveInterval=15",
     "-o", "ControlMaster=auto",
     "-o", `ControlPath=${join(homedir(), ".ssh", "bb-ssh-%C")}`,
     "-o", "ControlPersist=300",
-    host,
+    ...(await destinationArgs(host)),
     script,
   ];
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn("ssh", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: secretEnv === null ? process.env : { ...process.env, ...secretEnv },
+    });
     const chunks: Buffer[] = [];
     let bytes = 0;
     let stderr = "";

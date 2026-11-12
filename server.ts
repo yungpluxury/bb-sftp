@@ -1,5 +1,8 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { parseSftpConfig, type SftpTarget } from "./sftp.ts";
 import {
   createLocalHasher,
   findLinkTarget,
@@ -16,8 +19,11 @@ import {
   countDirEntries,
   deleteRemoteDir,
   deleteRemoteFile,
+  destinationArgs,
   downloadRemoteFile,
   listConfiguredHosts,
+  registerSftpTargets,
+  registeredSftpTargets,
   listDir,
   makeRemoteDir,
   MAX_FILE_BYTES,
@@ -66,7 +72,7 @@ export type RemoteEntry = z.infer<typeof entrySchema>;
 
 export const rpcContract = defineRpcContract({
   ssh_hosts: {
-    input: z.null(),
+    input: z.object({ threadId: z.string().min(1).optional() }).nullable(),
     output: z.object({
       hosts: z.array(z.string()),
       roots: z.record(z.string(), z.string()),
@@ -235,18 +241,58 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function requireLocalPath(host: string, path: string): Promise<string> {
-    const link = (await readLinks())[host];
+    const link = (await allLinks())[host];
     const localPath = link === undefined ? null : localPathFor(link, path);
     if (localPath === null) throw new Error("Файл вне связанной папки");
     return localPath;
   }
 
+  async function threadFolders(threadId: string): Promise<string[]> {
+    const thread = await bb.sdk.threads.get({ threadId });
+    const folders: string[] = [];
+    if (thread.environmentId !== null) {
+      const { path } = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+      if (path !== null) folders.push(path);
+    }
+    if (thread.projectId !== null) {
+      const project = await bb.sdk.projects.get({ projectId: thread.projectId });
+      for (const source of project.sources) if (source.path !== null) folders.push(source.path);
+    }
+    return [...new Set(folders)];
+  }
+
+  async function loadThreadSftp(threadId: string): Promise<SftpTarget[]> {
+    const found = new Map<string, SftpTarget>();
+    for (const folder of await threadFolders(threadId)) {
+      const text = await readFile(join(folder, ".vscode", "sftp.json"), "utf8").catch(() => null);
+      if (text === null) continue;
+      try {
+        for (const target of parseSftpConfig(text, folder)) if (!found.has(target.id)) found.set(target.id, target);
+      } catch {
+        bb.log.warn(`sftp.json in ${folder} is not valid JSON`);
+      }
+    }
+    const targets = [...found.values()];
+    registerSftpTargets(targets);
+    return targets;
+  }
+
+  async function allLinks(): Promise<Record<string, Link>> {
+    const fromSftp = Object.fromEntries(
+      registeredSftpTargets().map((target) => [target.id, { local: target.local, remote: target.remotePath }]),
+    );
+    return { ...fromSftp, ...(await readLinks()) };
+  }
+
   bb.rpc.register(rpcContract, {
-    ssh_hosts: async () => ({
-      hosts: await listConfiguredHosts(),
-      roots: await readRoots(),
-      links: await readLinks(),
-    }),
+    ssh_hosts: async (input) => {
+      const sftp = input?.threadId === undefined ? [] : await loadThreadSftp(input.threadId);
+      return {
+        hosts: [...sftp.map((target) => target.id), ...(await listConfiguredHosts())],
+        roots: await readRoots(),
+        links: await allLinks(),
+      };
+    },
     ssh_set_link: async ({ host, local, remote }) => {
       const links = await readLinks();
       if (local.trim() === "") {
@@ -260,7 +306,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { links };
     },
     ssh_local_status: async ({ host, path }) => {
-      const link = (await readLinks())[host];
+      const link = (await allLinks())[host];
       const localPath = link === undefined ? null : localPathFor(link, path);
       if (localPath === null) return { linked: false as const };
       const data = await readLocal(localPath, MAX_TRANSFER_BYTES);
@@ -274,7 +320,7 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
     ssh_dir_diff: async ({ host, path }) => {
-      const link = (await readLinks())[host];
+      const link = (await allLinks())[host];
       const remote = link?.remote.replace(/\/+$/, "") || "/";
       if (link === undefined || (path !== remote && localPathFor(link, path) === null)) {
         return { linked: false, statuses: {} };
@@ -331,22 +377,12 @@ export default async function plugin(bb: BbPluginApi) {
       return result;
     },
     ssh_thread_target: async ({ threadId }) => {
-      const thread = await bb.sdk.threads.get({ threadId });
-      const candidates: string[] = [];
-      if (thread.environmentId !== null) {
-        const { path } = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-        if (path !== null) candidates.push(path);
-      }
-      if (thread.projectId !== null) {
-        const project = await bb.sdk.projects.get({ projectId: thread.projectId });
-        for (const source of project.sources) if (source.path !== null) candidates.push(source.path);
-      }
-      return findLinkTarget(await readLinks(), candidates);
+      const sftp = await loadThreadSftp(threadId);
+      if (sftp.length > 0) return { host: sftp[0].id, dir: sftp[0].remotePath };
+      return findLinkTarget(await readLinks(), await threadFolders(threadId));
     },
     ssh_open_terminal: async ({ host, dir, threadId }) => {
-      if (!(await listConfiguredHosts()).includes(host)) {
-        throw new Error(`Хоста «${host}» нет в ~/.ssh/config`);
-      }
+      const destination = await destinationArgs(host);
       const { primaryHostId } = await bb.sdk.system.config();
       if (primaryHostId === null) throw new Error("bb не знает свою машину, терминал открыть нельзя");
       const cd = dir === "" ? "" : `cd -- ${shQuote(dir)}; `;
@@ -358,7 +394,7 @@ export default async function plugin(bb: BbPluginApi) {
           threadId === null || threadId === undefined
             ? { kind: "host_path", hostId: primaryHostId, cwd: null }
             : { kind: "thread", threadId },
-        start: { mode: "argv", argv: ["ssh", "-t", host, `${cd}exec "\${SHELL:-/bin/sh}" -l`] },
+        start: { mode: "argv", argv: ["ssh", "-t", ...destination, `${cd}exec "\${SHELL:-/bin/sh}" -l`] },
       });
       return { terminalId: terminal.id };
     },
